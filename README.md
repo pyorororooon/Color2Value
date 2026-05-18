@@ -1,4 +1,6 @@
 # Color2Value
+<img width="2000" height="1414" alt="Sea Surface Salinity" src="https://github.com/user-attachments/assets/6eb60253-bbda-4fb2-b5b2-2cfaedb15101" />
+
 A screen-reading digitizer to extract exact values from color maps.
 
 First release of Color2Value! 
