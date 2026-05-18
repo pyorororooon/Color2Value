@@ -5,6 +5,13 @@ import mss
 from PIL import Image, ImageTk, ImageOps
 import keyboard
 import threading
+import sys
+import os
+
+def resource_path(relative_path):
+    """PyInstaller (_MEIPASS) と通常実行の両方に対応したリソースパスを返す"""
+    base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, relative_path)
 
 class ColorPickerApp:
     def __init__(self):
@@ -46,7 +53,7 @@ class ColorPickerApp:
             print("pystray not installed: pip install pystray")
             return
 
-        icon_img = Image.open(r"D:\download\Color2Valueapp\Color2Value.ico")
+        icon_img = Image.open(resource_path("Color2Value.ico"))
 
         menu = pystray.Menu(
             pystray.MenuItem('Color Picker', None, enabled=False),
@@ -65,7 +72,7 @@ class ColorPickerApp:
 
     def _show_welcome_image(self):
         """起動時チュートリアル画像をスクリーン面積の1/4サイズで中央表示"""
-        img_path = r"D:\download\Color2Valueapp\Sea Surface Salinity.jpg"
+        img_path = resource_path("Sea Surface Salinity.jpg")
         try:
             img = Image.open(img_path)
         except Exception:
