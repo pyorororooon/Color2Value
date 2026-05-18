@@ -36,6 +36,7 @@ class ColorPickerApp:
         self.value_map       = None  # [(frac, value), ...] キャリブレーション後に設定
         self._calib_region   = None  # 再検出用に選択領域を保持
         self._easyocr_reader = None  # 遅延初期化
+        self._colorbar_canvas = None  # カラーバーを描画したキャンバス
 
         # ホットキー: Ctrl+F9（左右どちらのCtrlでも反応、Altを使わない）
         self._ctrl_pressed = False
@@ -368,6 +369,9 @@ class ColorPickerApp:
             if self._calib_region is None or self.mode != "pick_color":
                 return
             self.value_map = None
+            if self._colorbar_canvas:
+                self._colorbar_canvas.delete("tick_label")
+                self._colorbar_canvas.delete("tick_editor")
             region = self._calib_region
             self.show_message("Pick Color",
                               "Re-analyzing ticks…  •  Click to pick  •  Esc to close", 2)
@@ -455,14 +459,19 @@ class ColorPickerApp:
                 outline="red", width=2, dash=(4, 4)
             )
         elif self.mode == "pick_color":
-            # result/messageタグ項目（ボタン等）の上のクリックは色取得をスキップ
+            # result/message/tick_label タグ項目の上のクリックは色取得をスキップ
             hit = set(event.widget.find_overlapping(
                 event.x - 1, event.y - 1, event.x + 1, event.y + 1))
             tagged = (set(event.widget.find_withtag("result")) |
-                      set(event.widget.find_withtag("message")))
+                      set(event.widget.find_withtag("message")) |
+                      set(event.widget.find_withtag("tick_label")) |
+                      set(event.widget.find_withtag("tick_editor")))
             if hit & tagged:
                 return
-            self.pick_and_highlight(event.x, event.y)
+            if event.state & 0x1:  # Shiftキー: 目盛りを手動追加
+                self._add_tick_at(event.x, event.y)
+            else:
+                self.pick_and_highlight(event.x, event.y)
 
     def on_mouse_drag(self, event):
         if self.mode == "select_bar" and self.rect_id:
@@ -478,6 +487,7 @@ class ColorPickerApp:
                 return
 
             self.colorbar_bbox = (x1, y1, x2, y2)
+            self._colorbar_canvas = self.canvas
             
             # 選択領域全体を先に切り出す（OCRスレッドと共用）
             vox, voy = self.canvas_offset
@@ -565,9 +575,20 @@ class ColorPickerApp:
         PAD_X, PAD_Y, AW, LINE_SP = 18, 12, 5, 4
 
         if self.value_map and len(self.value_map) >= 2:
-            fracs = [p for p, v in self.value_map]
-            vals  = [v for p, v in self.value_map]
-            value = float(np.interp(position, fracs, vals))
+            # frac 昇順にソート
+            sorted_map = sorted(self.value_map, key=lambda x: x[0])
+            fracs = [p for p, v in sorted_map]
+            vals  = [v for p, v in sorted_map]
+            if position <= fracs[0]:
+                # 下端より外側: 最初の2点の傾きで線形外挿
+                slope = (vals[1] - vals[0]) / (fracs[1] - fracs[0])
+                value = vals[0] + slope * (position - fracs[0])
+            elif position >= fracs[-1]:
+                # 上端より外側: 最後の2点の傾きで線形外挿
+                slope = (vals[-1] - vals[-2]) / (fracs[-1] - fracs[-2])
+                value = vals[-1] + slope * (position - fracs[-1])
+            else:
+                value = float(np.interp(position, fracs, vals))
             title     = f"Value: {value:.4g}"
             hint      = f"Position: {position:.1%}  •  \u0394E = {delta_e:.1f}"
             copy_text = f"{value:.4g}"
@@ -640,7 +661,203 @@ class ColorPickerApp:
             cv.tag_bind(item_id, "<Enter>",    on_enter)
             cv.tag_bind(item_id, "<Leave>",    on_leave)
 
-    # -------- 目盛り自動検出 + EasyOCR キャリブレーション --------
+    # -------- 目盛りラベル表示・編集 --------
+
+    def _draw_tick_labels(self):
+        """キャリブレーション済み目盛り値をカラーバー隣に描画。クリックで値を編集できる。
+        縦型カラーバー: カラーバー右横に表示
+        横型カラーバー: カラーバー下に表示
+        """
+        cv = self._colorbar_canvas
+        if cv is None:
+            return
+        cv.delete("tick_label")
+        if not self.value_map or not self.colorbar_bbox:
+            return
+
+        x1, y1, x2, y2 = self.colorbar_bbox
+        FONT = ("Segoe UI", 9)
+        PAD = 3
+
+        for i, (frac, val) in enumerate(self.value_map):
+            if self.is_vertical:
+                tx = x2 + 8
+                ty = int(y1 + frac * (y2 - y1))
+                anchor = tk.W
+            else:
+                tx = int(x1 + frac * (x2 - x1))
+                ty = y2 + 8
+                anchor = tk.N
+
+            label = f"{val:.4g}"
+            tid = cv.create_text(tx, ty, text=label, fill="#e5e7eb",
+                                 font=FONT, anchor=anchor, tags="tick_label")
+            bb = cv.bbox(tid)
+            bg_id = None
+            del_id = None
+            if bb:
+                bg_id = cv.create_rectangle(
+                    bb[0] - PAD, bb[1] - PAD, bb[2] + PAD, bb[3] + PAD,
+                    fill="#1f2937", outline="#4b5563", width=1, tags="tick_label"
+                )
+                cv.tag_lower(bg_id, tid)
+                # × 削除ボタン (ラベル背景の右隣に配置)
+                del_x = bb[2] + PAD + 5
+                del_y = (bb[1] + bb[3]) // 2
+                del_id = cv.create_text(del_x, del_y, text="×",
+                                        fill="#6b7280", font=("Segoe UI", 10),
+                                        anchor=tk.W, tags="tick_label")
+
+            def _make_handlers(idx_, frac_, tx_, ty_, anc_, bg_, t_, del_):
+                def on_clk(event):
+                    self._open_tick_editor(idx_, frac_, tx_, ty_, anc_)
+                def on_ent(event):
+                    if bg_: cv.itemconfig(bg_, fill="#374151")
+                    cv.itemconfig(t_, fill="#f9fafb")
+                    cv.config(cursor="hand2")
+                def on_lv(event):
+                    if bg_: cv.itemconfig(bg_, fill="#1f2937")
+                    cv.itemconfig(t_, fill="#e5e7eb")
+                    cv.config(cursor="crosshair")
+                def on_del_clk(event):
+                    if self.value_map and 0 <= idx_ < len(self.value_map):
+                        del self.value_map[idx_]
+                        cv.delete("tick_editor")
+                        self._draw_tick_labels()
+                def on_del_ent(event):
+                    if del_: cv.itemconfig(del_, fill="#ef4444")
+                    cv.config(cursor="hand2")
+                def on_del_lv(event):
+                    if del_: cv.itemconfig(del_, fill="#6b7280")
+                    cv.config(cursor="crosshair")
+                return on_clk, on_ent, on_lv, on_del_clk, on_del_ent, on_del_lv
+
+            (on_clk, on_ent, on_lv,
+             on_del_clk, on_del_ent, on_del_lv) = _make_handlers(
+                i, frac, tx, ty, anchor, bg_id, tid, del_id)
+            items = [tid] + ([bg_id] if bg_id else [])
+            for item in items:
+                cv.tag_bind(item, "<Button-1>", on_clk)
+                cv.tag_bind(item, "<Enter>",    on_ent)
+                cv.tag_bind(item, "<Leave>",    on_lv)
+            if del_id:
+                cv.tag_bind(del_id, "<Button-1>", on_del_clk)
+                cv.tag_bind(del_id, "<Enter>",    on_del_ent)
+                cv.tag_bind(del_id, "<Leave>",    on_del_lv)
+
+    def _open_tick_editor(self, idx, frac, lx, ly, anchor):
+        """指定インデックスの目盛り値を編集するインライン Entry をキャンバス上に表示する。
+        Enter/Return: 確定して value_map を更新し再描画
+        Escape: キャンセル
+        フォーカスアウト: 確定
+        """
+        cv = self._colorbar_canvas
+        if cv is None:
+            return
+        cv.delete("tick_editor")
+
+        current_val = f"{self.value_map[idx][1]:.4g}"
+        var = tk.StringVar(value=current_val)
+        entry = tk.Entry(
+            cv, textvariable=var, width=8,
+            font=("Segoe UI", 9),
+            bg="#111827", fg="#f9fafb",
+            insertbackground="#f9fafb",
+            highlightbackground="#6366f1",
+            highlightcolor="#6366f1",
+            highlightthickness=2,
+            relief="flat", bd=0
+        )
+        cv.create_window(lx, ly, window=entry, anchor=anchor, tags="tick_editor")
+        entry.focus_set()
+        entry.select_range(0, tk.END)
+
+        committed = [False]  # FocusOut と Return の二重発火防止
+
+        def commit(event=None):
+            if committed[0]:
+                return
+            committed[0] = True
+            try:
+                new_val = float(var.get().strip())
+                f, _ = self.value_map[idx]
+                self.value_map[idx] = (f, new_val)
+            except ValueError:
+                pass
+            cv.delete("tick_editor")
+            self._draw_tick_labels()
+
+        def cancel(event=None):
+            if committed[0]:
+                return
+            committed[0] = True
+            cv.delete("tick_editor")
+            self._draw_tick_labels()
+
+        entry.bind("<Return>",   commit)
+        entry.bind("<KP_Enter>", commit)
+        entry.bind("<Escape>",   cancel)
+        entry.bind("<FocusOut>", commit)
+
+    def _add_tick_at(self, cx, cy):
+        """カラーバー上の指定位置に目盛りを手動追加するインライン Entry を表示する。
+        値を入力して Enter で追加、Escape でキャンセル。
+        """
+        if not self.colorbar_bbox or self._colorbar_canvas is None:
+            return
+        x1, y1, x2, y2 = self.colorbar_bbox
+        if self.is_vertical:
+            frac = (cy - y1) / max(y2 - y1, 1)
+            lx, ly, anchor = x2 + 8, cy, tk.W
+        else:
+            frac = (cx - x1) / max(x2 - x1, 1)
+            lx, ly, anchor = cx, y2 + 8, tk.N
+        frac = max(0.0, min(1.0, frac))
+
+        cv = self._colorbar_canvas
+        cv.delete("tick_editor")
+
+        var = tk.StringVar(value="")
+        entry = tk.Entry(
+            cv, textvariable=var, width=8,
+            font=("Segoe UI", 9),
+            bg="#111827", fg="#f9fafb",
+            insertbackground="#f9fafb",
+            highlightbackground="#10b981",
+            highlightcolor="#10b981",
+            highlightthickness=2,
+            relief="flat", bd=0
+        )
+        cv.create_window(lx, ly, window=entry, anchor=anchor, tags="tick_editor")
+        entry.focus_set()
+
+        committed = [False]
+
+        def commit(event=None):
+            if committed[0]:
+                return
+            committed[0] = True
+            try:
+                new_val = float(var.get().strip())
+                if self.value_map is None:
+                    self.value_map = []
+                self.value_map.append((frac, new_val))
+                self.value_map.sort(key=lambda x: x[0])
+            except ValueError:
+                pass
+            cv.delete("tick_editor")
+            self._draw_tick_labels()
+
+        def cancel(event=None):
+            if committed[0]:
+                return
+            committed[0] = True
+            cv.delete("tick_editor")
+
+        entry.bind("<Return>",   commit)
+        entry.bind("<KP_Enter>", commit)
+        entry.bind("<Escape>",   cancel)
+        entry.bind("<FocusOut>", commit)
 
     def _calibrate_background(self, region):
         """バックグラウンドスレッド: 目盛り検出 → OCR → value_map 構築"""
@@ -663,15 +880,20 @@ class ColorPickerApp:
         vmin = min(v for _, v in pairs)
         vmax = max(v for _, v in pairs)
         self.show_message("Pick Color",
-                          f"{len(pairs)} ticks detected  [{vmin:.4g} – {vmax:.4g}]  •  Esc to close", 2)
+                          f"{len(pairs)} ticks  [{vmin:.4g} – {vmax:.4g}]  •  Shift+click: +tick  •  Esc to close", 2)
+        self._draw_tick_labels()
 
     def _on_calibration_failed(self):
+        if self._colorbar_canvas:
+            self._colorbar_canvas.delete("tick_label")
+            self._colorbar_canvas.delete("tick_editor")
         self.show_message("Pick Color",
                           "No ticks found (showing position%)  •  Click to pick  •  Esc to close", 2)
 
     def _detect_ticks_and_ocr(self, region, is_vertical):
         """目盛り位置を検出してOCRで値を読み取る。[(frac, value), ...] を返す。"""
-        tick_fracs, label_side = self._find_tick_positions(region, is_vertical)
+        cb_center = self._find_colorbar_center(region, is_vertical)
+        tick_fracs, label_side = self._find_tick_positions(region, is_vertical, cb_center)
         if len(tick_fracs) < 2:
             return []
         try:
@@ -686,87 +908,130 @@ class ColorPickerApp:
 
         pairs = []
         for i, (frac, px) in enumerate(zip(tick_fracs, tick_px)):
-            # 隣接目盛りとの距離の半分をOCRウィンドウ高さの上限にする。
-            # 補助目盛り: 遙い → ウィンドウが素数px → OCR失敗 → 自然と除外
-            # 主目盛り: 広い → ウィンドウが十分 → 正常読み取り
             gaps = []
             if i > 0:
                 gaps.append(px - tick_px[i - 1])
             if i < len(tick_px) - 1:
                 gaps.append(tick_px[i + 1] - px)
-            max_lh = max(4, min(18, min(gaps) // 2 - 1)) if gaps else 18
+            max_lh = max(6, min(40, min(gaps) // 2)) if gaps else 40
 
             val = self._ocr_label_at(
-                region, frac, is_vertical, label_side, reader, max_lh)
+                region, frac, is_vertical, label_side, reader, max_lh, cb_center)
             if val is not None:
                 pairs.append((frac, val))
         return pairs
 
-    def _find_tick_positions(self, region, is_vertical):
+    def _find_tick_positions(self, region, is_vertical, cb_center=None):
         """目盛り線を検出。(tick_fractions_list, side) を返す。"""
         H, W = region.shape[:2]
+
+        def best_in_band(b0, b1, total_len, horizontal=False):
+            """バンド内を複数の細いストリップで走査し、最良の結果を返す。"""
+            bw = b1 - b0
+            sw = max(2, min(12, bw))
+            best_ticks, best_score = [], 0.0
+            step = max(1, sw // 2)
+            for sx in range(b0, b1 - sw + 1, step):
+                sx1 = min(b1, sx + sw)
+                strip = (region[sx:sx1, :, :].transpose(1, 0, 2)
+                         if horizontal else region[:, sx:sx1, :])
+                t = self._ticks_from_strip(strip, total_len)
+                score = self._tick_score(t, total_len)
+                if score > best_score:
+                    best_ticks, best_score = t, score
+            # フォールバック: バンド全体を1ストリップとして試す
+            if len(best_ticks) < 2:
+                strip = (region[b0:b1, :, :].transpose(1, 0, 2)
+                         if horizontal else region[:, b0:b1, :])
+                t = self._ticks_from_strip(strip, total_len)
+                if len(t) > len(best_ticks):
+                    best_ticks = t
+            return best_ticks
+
         if is_vertical:
-            cx, half = W // 2, max(2, W // 10)
-            sw = min(8, max(3, W // 15))   # 目盛り帯幅
-            for side, x0, x1 in [
-                ('right', cx + half,       cx + half + sw),
-                ('left',  cx - half - sw,  cx - half),
+            cx   = cb_center if cb_center is not None else W // 2
+            half = max(2, W // 10)
+            # 目盛りマーカーが延びる幅のみ走査（ラベルテキスト領域を除外する）
+            tick_zone = max(8, min(25, W // 8))
+            for side, z_start, z_end in [
+                ('right', cx + half,                     min(W, cx + half + tick_zone)),
+                ('left',  max(0, cx - half - tick_zone), cx - half),
             ]:
-                x0, x1 = max(0, x0), min(W, x1)
-                if x1 - x0 < 2:
+                z_start, z_end = max(0, z_start), min(W, z_end)
+                if z_end - z_start < 2:
                     continue
-                ticks = self._ticks_from_strip(region[:, x0:x1, :], H)
+                ticks = best_in_band(z_start, z_end, H)
                 if len(ticks) >= 2:
                     return [t / max(H - 1, 1) for t in ticks], side
         else:
-            cy, half = H // 2, max(2, H // 10)
-            sw = min(8, max(3, H // 15))
-            for side, y0, y1 in [
-                ('bottom', cy + half,       cy + half + sw),
-                ('top',    cy - half - sw,  cy - half),
+            cy   = cb_center if cb_center is not None else H // 2
+            half = max(2, H // 10)
+            tick_zone = max(8, min(25, H // 8))
+            for side, z_start, z_end in [
+                ('bottom', cy + half,                     min(H, cy + half + tick_zone)),
+                ('top',    max(0, cy - half - tick_zone), cy - half),
             ]:
-                y0, y1 = max(0, y0), min(H, y1)
-                if y1 - y0 < 2:
+                z_start, z_end = max(0, z_start), min(H, z_end)
+                if z_end - z_start < 2:
                     continue
-                ticks = self._ticks_from_strip(
-                    region[y0:y1, :, :].transpose(1, 0, 2), W)
+                ticks = best_in_band(z_start, z_end, W, horizontal=True)
                 if len(ticks) >= 2:
                     return [t / max(W - 1, 1) for t in ticks], side
         return [], 'right'
+
+    @staticmethod
+    def _tick_score(ticks, total_len):
+        """目盛りリストの品質スコアを返す（多く・等間隔ほど高い）。"""
+        n = len(ticks)
+        if n < 2:
+            return float(n)
+        gaps = [ticks[i + 1] - ticks[i] for i in range(n - 1)]
+        mean_g = sum(gaps) / len(gaps)
+        if mean_g == 0:
+            return 0.0
+        variance = sum((g - mean_g) ** 2 for g in gaps) / len(gaps)
+        std_g = variance ** 0.5
+        return n * (1.0 / (1.0 + std_g / mean_g))
 
     def _ticks_from_strip(self, strip, total_len):
         """
         strip: (total_len, strip_width, 3) の細い帯。
         輝度が背景から逸脱した行の中心インデックスリストを返す。
+        明背景・暗背景の両方に対応。
         """
         gray     = (0.299 * strip[..., 0] +
                     0.587 * strip[..., 1] +
                     0.114 * strip[..., 2]).astype(np.float32)
         row_mean = gray.mean(axis=1)                    # (total_len,)
-        bg       = np.percentile(row_mean, 80)
-        dev      = np.abs(row_mean - bg)
-        if dev.max() < 10:
-            return []
-        is_tick = dev > dev.max() * 0.35
-        # 連続するTrue行をクラスタリングして中心を取得
-        ticks, i = [], 0
-        while i < total_len:
-            if is_tick[i]:
-                j = i + 1
-                while j < total_len and is_tick[j]:
-                    j += 1
-                ticks.append((i + j) // 2)
-                i = j
-            else:
-                i += 1
-        # 近接目盛り(<5px)を除去
-        filtered = [ticks[0]] if ticks else []
-        for t in ticks[1:]:
-            if t - filtered[-1] >= 5:
-                filtered.append(t)
-        return filtered
 
-    def _ocr_label_at(self, region, frac, is_vertical, side, reader, lh=18):
+        def extract_ticks(bg_pct):
+            bg  = np.percentile(row_mean, bg_pct)
+            dev = np.abs(row_mean - bg)
+            if dev.max() < 5:
+                return []
+            is_tick = dev > dev.max() * 0.25
+            ticks, i = [], 0
+            while i < total_len:
+                if is_tick[i]:
+                    j = i + 1
+                    while j < total_len and is_tick[j]:
+                        j += 1
+                    ticks.append((i + j) // 2)
+                    i = j
+                else:
+                    i += 1
+            filtered = [ticks[0]] if ticks else []
+            for t in ticks[1:]:
+                if t - filtered[-1] >= 4:
+                    filtered.append(t)
+            return filtered
+
+        # 明背景(暗い目盛り)と暗背景(明るい目盛り)の両方を試して多い方を採用
+        ticks_light = extract_ticks(80)
+        ticks_dark  = extract_ticks(20)
+        return ticks_light if len(ticks_light) >= len(ticks_dark) else ticks_dark
+
+    def _ocr_label_at(self, region, frac, is_vertical, side, reader, lh=40, cb_center=None):
         """目盛り位置の近傍をクロップしてOCR。float を返す。失敗時は None。
         lh: OCRクロップの上下マージン(px)。隔隣目盛りとの距離の半分を渡すことで
         補助目盛りの隣の主目盛りラベルを誤読するのを防ぐ。
@@ -774,59 +1039,107 @@ class ColorPickerApp:
         H, W = region.shape[:2]
         if is_vertical:
             y    = int(frac * (H - 1))
-            cx, half = W // 2, max(2, W // 10)
-            sw   = min(8, max(3, W // 15))
+            cx   = cb_center if cb_center is not None else W // 2
+            half = max(2, W // 10)
             y0, y1 = max(0, y - lh), min(H, y + lh)
             if side == 'right':
-                x0, x1 = cx + half + sw, W
+                x0, x1 = cx + half, W
             else:
-                x0, x1 = 0, max(0, cx - half - sw)
+                x0, x1 = 0, max(0, cx - half)
         else:
             x    = int(frac * (W - 1))
-            cy, half = H // 2, max(2, H // 10)
-            sw   = min(8, max(3, H // 15))
+            cy   = cb_center if cb_center is not None else H // 2
+            half = max(2, H // 10)
             x0, x1 = max(0, x - lh), min(W, x + lh)
             if side == 'bottom':
-                y0, y1 = cy + half + sw, H
+                y0, y1 = cy + half, H
             else:
-                y0, y1 = 0, max(0, cy - half - sw)
+                y0, y1 = 0, max(0, cy - half)
         if x1 - x0 < 4 or y1 - y0 < 4:
             return None
 
         # パディング追加（端の文字が切れるのを防ぐ）
-        PAD = 8
+        PAD = 6
         y0 = max(0, y0 - PAD); y1 = min(H, y1 + PAD)
         x0 = max(0, x0 - PAD); x1 = min(W, x1 + PAD)
         crop = region[y0:y1, x0:x1]
 
-        # アップスケール（目標高さ80px、LANCZOSで高品質補間）
-        # NEAREST は数字の輪郭が階段状になり誤認識の原因になる
+        # アップスケール（目標高さ96px、LANCZOSで高品質補間）
         ch, cw = crop.shape[:2]
-        scale = max(1, 80 // max(ch, 1))
+        scale = max(1, 96 // max(ch, 1))
         pil_img = Image.fromarray(crop)
         if scale > 1:
             pil_img = pil_img.resize((cw * scale, ch * scale), Image.LANCZOS)
 
         # グレースケール変換 + 自動コントラスト強調
-        # 上下2%を飽和させてコントラストを最大化（薄いテキストも明確に）
         gray = ImageOps.autocontrast(pil_img.convert('L'), cutoff=2)
-        crop_final = np.array(gray.convert('RGB'))
 
-        # OCR: detail=1 で信頼度スコアを取得し、最高信頼度の結果を採用
-        results = reader.readtext(crop_final, detail=1,
-                                  allowlist='0123456789.-',
-                                  adjust_contrast=0.5)
-        best_val, best_conf = None, 0.0
-        for (_, text, conf) in results:
-            if conf < 0.35:
-                continue
-            text = text.strip().replace(' ', '').replace('O', '0').replace('l', '1')
-            try:
-                val = float(text)
-                if conf > best_conf:
-                    best_val, best_conf = val, conf
-            except ValueError:
-                pass
+        _SUBS = str.maketrans('OolISBZG', '00115826')
+
+        def _ocr_best(img_arr):
+            results = reader.readtext(img_arr, detail=1,
+                                      allowlist='0123456789.-eE+',
+                                      adjust_contrast=0.5)
+            if not results:
+                return None, 0.0
+            # 左→右の順にソート（小数点が別ボックスになる場合に備える）
+            results.sort(key=lambda r: (r[0][0][0] + r[0][2][0]) / 2)
+            texts = [r[1].strip().replace(' ', '').translate(_SUBS) for r in results]
+            confs = [r[2] for r in results]
+            n = len(results)
+
+            candidates = []  # (val, eff_conf)
+
+            def _try(s, eff_conf):
+                try:
+                    candidates.append((float(s), eff_conf))
+                except ValueError:
+                    pass
+
+            # 個別ボックス
+            for t, c in zip(texts, confs):
+                if c >= 0.25:
+                    _try(t, c)
+
+            # 隣接ボックスをマージ（"0"+"8"→"08" or "0.8" など）
+            for i in range(n):
+                for j in range(i + 2, n + 1):
+                    chunk = texts[i:j]
+                    avg_c = sum(confs[i:j]) / (j - i)
+                    if avg_c < 0.15:
+                        continue
+                    _try(''.join(chunk), avg_c * 0.9)          # 単純連結
+                    if len(chunk) == 2:                         # 2ボックス: "."を挿入
+                        _try(chunk[0] + '.' + chunk[1], avg_c * 0.95)
+                    if len(chunk) == 3:                         # 3ボックス: 各位置に挿入
+                        _try(chunk[0] + '.' + chunk[1] + chunk[2], avg_c * 0.90)
+                        _try(chunk[0] + chunk[1] + '.' + chunk[2], avg_c * 0.90)
+
+            if not candidates:
+                return None, 0.0
+
+            # 小数点を含む数値を優先（"0.8" > "0" or "8"）; 次に有効文字数; 次に信頼度
+            def _score(vc):
+                val, conf = vc
+                s = repr(val)
+                has_meaningful_dec = ('.' in s and not s.endswith('.0'))
+                n_chars = len(s.replace('.', '').replace('-', ''))
+                return (has_meaningful_dec, n_chars, conf)
+
+            best_val, best_conf = max(candidates, key=_score)
+            return best_val, best_conf
+
+        # 通常画像でOCR
+        crop_normal = np.array(gray.convert('RGB'))
+        best_val, best_conf = _ocr_best(crop_normal)
+
+        # 信頼度が低い場合は反転画像でも試みる（暗背景・白文字対応）
+        if best_conf < 0.7:
+            crop_inv = np.array(ImageOps.invert(gray).convert('RGB'))
+            inv_val, inv_conf = _ocr_best(crop_inv)
+            if inv_conf > best_conf:
+                best_val = inv_val
+
         return best_val
 
     def _ensure_ocr_reader(self):
@@ -904,6 +1217,8 @@ class ColorPickerApp:
         self.canvas_offset = (0, 0)
         self.colorbar_array = None
         self.colorbar_lab   = None
+        self.colorbar_bbox  = None
+        self._colorbar_canvas = None
         self.value_map      = None
         self._calib_region  = None
         self.mag_tk_img = None
