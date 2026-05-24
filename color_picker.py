@@ -7,6 +7,7 @@ import keyboard
 import threading
 import sys
 import os
+import webbrowser
 
 def resource_path(relative_path):
     """PyInstaller (_MEIPASS) と通常実行の両方に対応したリソースパスを返す"""
@@ -14,6 +15,10 @@ def resource_path(relative_path):
     return os.path.join(base, relative_path)
 
 class ColorPickerApp:
+    _TICK_MIN_GAP = 3
+    _TICK_MAX_ZONE = 48
+    _DONATION_URL = "https://buymeacoffee.com/pyorororo0224"
+
     def __init__(self):
         self.root = tk.Tk()
         self.root.withdraw() # メインウィンドウは常に隠しておく
@@ -94,8 +99,17 @@ class ColorPickerApp:
         tk_img = ImageTk.PhotoImage(img)
         cv = tk.Canvas(win, width=nw, height=nh, highlightthickness=0)
         cv.pack()
-        cv.create_image(0, 0, anchor=tk.NW, image=tk_img)
+        img_id = cv.create_image(0, 0, anchor=tk.NW, image=tk_img)
         cv._img = tk_img  # GC防止
+
+        donation_top = int(nh * 4 / 5)  # 画像下1/5のみを寄付リンク領域にする
+        drag_state = {
+            "press_x": 0,
+            "press_y": 0,
+            "win_x": 0,
+            "win_y": 0,
+            "moved": False,
+        }
 
         BTN = 32
         bx, by = nw - BTN - 10, 10
@@ -113,6 +127,46 @@ class ColorPickerApp:
             cv.tag_bind(item, "<Button-1>", close)
             cv.tag_bind(item, "<Enter>",    on_enter)
             cv.tag_bind(item, "<Leave>",    on_leave)
+
+        close_items = {bg_id, ic_id}
+
+        def on_press(e):
+            drag_state["press_x"] = e.x_root
+            drag_state["press_y"] = e.y_root
+            drag_state["win_x"] = win.winfo_x()
+            drag_state["win_y"] = win.winfo_y()
+            drag_state["moved"] = False
+
+        def on_drag(e):
+            dx = e.x_root - drag_state["press_x"]
+            dy = e.y_root - drag_state["press_y"]
+            if abs(dx) >= 3 or abs(dy) >= 3:
+                drag_state["moved"] = True
+            if drag_state["moved"]:
+                win.geometry(f"+{drag_state['win_x'] + dx}+{drag_state['win_y'] + dy}")
+
+        def on_release(e):
+            if drag_state["moved"]:
+                return
+            hit = set(cv.find_overlapping(e.x - 1, e.y - 1, e.x + 1, e.y + 1))
+            if hit & close_items:
+                return
+            if e.y >= donation_top:
+                webbrowser.open_new_tab(self._DONATION_URL)
+
+        def on_motion(e):
+            hit = set(cv.find_overlapping(e.x - 1, e.y - 1, e.x + 1, e.y + 1))
+            if hit & close_items:
+                return
+            if e.y >= donation_top:
+                cv.config(cursor="hand2")
+            else:
+                cv.config(cursor="fleur")
+
+        cv.bind("<ButtonPress-1>", on_press)
+        cv.bind("<B1-Motion>", on_drag)
+        cv.bind("<ButtonRelease-1>", on_release)
+        cv.bind("<Motion>", on_motion)
         win.bind("<Escape>", close)
 
     def _on_key_press(self, event):
@@ -893,33 +947,393 @@ class ColorPickerApp:
     def _detect_ticks_and_ocr(self, region, is_vertical):
         """目盛り位置を検出してOCRで値を読み取る。[(frac, value), ...] を返す。"""
         cb_center = self._find_colorbar_center(region, is_vertical)
-        tick_fracs, label_side = self._find_tick_positions(region, is_vertical, cb_center)
-        if len(tick_fracs) < 2:
-            return []
         try:
             reader = self._ensure_ocr_reader()
         except ImportError:
             print("easyocr not installed: pip install easyocr")
             return []
 
+        tick_fracs, label_side = self._find_tick_positions(region, is_vertical, cb_center)
+        if len(tick_fracs) < 2:
+            # 三角終端・断続目盛りなどでtick線検出が弱い場合は、
+            # ラベル位置のみでキャリブレーションするフォールバック。
+            pairs = self._ocr_pairs_from_labels_only(region, is_vertical, reader, cb_center)
+            if len(pairs) >= 2:
+                return pairs
+            # 緩い再試行
+            return self._ocr_pairs_from_labels_only(region, is_vertical, reader, cb_center, relax=True)
+
         H, W    = region.shape[:2]
         total   = (H if is_vertical else W) - 1
         tick_px = [int(f * total) for f in tick_fracs]
 
-        pairs = []
-        for i, (frac, px) in enumerate(zip(tick_fracs, tick_px)):
-            gaps = []
-            if i > 0:
-                gaps.append(px - tick_px[i - 1])
-            if i < len(tick_px) - 1:
-                gaps.append(tick_px[i + 1] - px)
-            max_lh = max(6, min(40, min(gaps) // 2)) if gaps else 40
+        sides = [label_side, self._opposite_side(label_side)]
+        best_pairs = []
+        best_score = -1.0
 
-            val = self._ocr_label_at(
-                region, frac, is_vertical, label_side, reader, max_lh, cb_center)
-            if val is not None:
-                pairs.append((frac, val))
+        # まずラベル帯を一括OCRし、最近傍の目盛りに割り当てる。
+        # 1 tickごとのOCRより、値と位置の対応ズレが起きにくい。
+        for tol_scale in (1.0, 1.45):
+            for side in sides:
+                pairs = self._ocr_pairs_by_tick_alignment(
+                    region, tick_px, is_vertical, side, reader, cb_center, tol_scale=tol_scale
+                )
+                filtered = self._filter_value_pairs(pairs)
+                score = self._pair_quality_score(filtered, expected_n=len(tick_px))
+                if score > best_score:
+                    best_pairs = filtered
+                    best_score = score
+
+        if len(best_pairs) >= 2:
+            return best_pairs
+
+        # フォールバック: 従来の1 tickずつOCR
+        fallback_best = []
+        fallback_score = -1.0
+        for lh_scale in (1.0, 1.5):
+            for side in sides:
+                pairs = []
+                for i, (frac, px) in enumerate(zip(tick_fracs, tick_px)):
+                    gaps = []
+                    if i > 0:
+                        gaps.append(px - tick_px[i - 1])
+                    if i < len(tick_px) - 1:
+                        gaps.append(tick_px[i + 1] - px)
+                    max_lh = max(8, min(64, int((min(gaps) // 2) * lh_scale))) if gaps else int(48 * lh_scale)
+
+                    val = self._ocr_label_at(
+                        region, frac, is_vertical, side, reader, max_lh, cb_center)
+                    if val is not None:
+                        pairs.append((frac, val))
+                filtered = self._filter_value_pairs(pairs)
+                score = self._pair_quality_score(filtered, expected_n=len(tick_px))
+                if score > fallback_score:
+                    fallback_best = filtered
+                    fallback_score = score
+        return fallback_best
+
+    @staticmethod
+    def _opposite_side(side):
+        table = {
+            'right': 'left',
+            'left': 'right',
+            'top': 'bottom',
+            'bottom': 'top',
+        }
+        return table.get(side, side)
+
+    @staticmethod
+    def _pair_quality_score(pairs, expected_n=0):
+        """(frac, value) 列の妥当性スコア。高いほど良い。"""
+        n = len(pairs)
+        if n < 2:
+            return -1.0
+        pairs = sorted(pairs, key=lambda x: x[0])
+        fracs = np.array([f for f, _ in pairs], dtype=np.float64)
+        vals = np.array([v for _, v in pairs], dtype=np.float64)
+        # 単調性
+        d = np.diff(vals)
+        mono = 1.0
+        if len(d) > 0:
+            direction = 1.0 if np.median(d) >= 0 else -1.0
+            mono = float(np.mean(direction * d >= 0))
+        # 線形当てはまり
+        if len(fracs) >= 2:
+            p = np.polyfit(fracs, vals, 1)
+            pred = p[0] * fracs + p[1]
+            rmse = float(np.sqrt(np.mean((vals - pred) ** 2)))
+            val_range = float(np.max(vals) - np.min(vals))
+            fit = 1.0 / (1.0 + rmse / max(val_range, 1e-6))
+        else:
+            fit = 0.0
+        cov = min(1.0, n / max(expected_n, 2)) if expected_n else min(1.0, n / 6.0)
+        return 1.6 * mono + 1.2 * fit + 1.0 * cov + 0.2 * n
+
+    @staticmethod
+    def _value_candidates_from_text(text):
+        """OCR文字列からあり得る数値候補を生成する。"""
+        s = text.strip().replace(' ', '')
+        if not s:
+            return []
+
+        vals = []
+
+        def _add(v):
+            if np.isfinite(v):
+                vals.append(float(v))
+
+        try:
+            _add(float(s))
+        except ValueError:
+            pass
+
+        sign = -1.0 if s.startswith('-') else 1.0
+        body = s[1:] if s.startswith(('-', '+')) else s
+        if body.isdigit() and body:
+            # 1桁は 0.x を候補に追加
+            if len(body) == 1:
+                _add(sign * float(f"0.{body}"))
+
+            # 100 -> 1.00 のような小数点脱落を補う
+            if len(body) >= 3:
+                _add(sign * float(f"{body[:-2]}.{body[-2:]}"))
+
+            # 25/50/75 は 0.25/0.50/0.75 の読み落としが多い
+            if body in ("25", "50", "75"):
+                _add(sign * float(f"0.{body}"))
+
+        uniq = []
+        seen = set()
+        for v in vals:
+            key = round(v, 8)
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(v)
+        return uniq
+
+    def _ocr_pairs_from_labels_only(self, region, is_vertical, reader, cb_center=None, relax=False):
+        """tick線が取れない場合に、ラベル位置のみで (frac, value) を推定する。"""
+        sides = ('right', 'left') if is_vertical else ('bottom', 'top')
+        best_pairs = []
+        best_score = -1.0
+        for side in sides:
+            cand = self._extract_label_candidates(region, is_vertical, side, reader, cb_center, relax=relax)
+            if len(cand) < 2:
+                continue
+            pairs = self._filter_value_pairs([(f, v) for f, v, _ in cand])
+            if len(pairs) < 2:
+                continue
+            score = self._pair_quality_score(pairs)
+            if score > best_score:
+                best_pairs = pairs
+                best_score = score
+        return best_pairs
+
+    def _extract_label_candidates(self, region, is_vertical, side, reader, cb_center=None, relax=False):
+        """指定sideのラベル帯から (frac, value, conf) 候補を抽出する。"""
+        H, W = region.shape[:2]
+        if is_vertical:
+            cx = cb_center if cb_center is not None else W // 2
+            half = max(2, W // 10)
+            band_w = max(40, min(W // 2, 140))
+            if side == 'right':
+                x0 = min(W, cx + half)
+                x1 = min(W, x0 + band_w)
+            else:
+                x1 = max(0, cx - half)
+                x0 = max(0, x1 - band_w)
+            y0, y1 = 0, H
+        else:
+            cy = cb_center if cb_center is not None else H // 2
+            half = max(2, H // 10)
+            band_h = max(28, min(H // 2, 90))
+            if side == 'bottom':
+                y0 = min(H, cy + half)
+                y1 = min(H, y0 + band_h)
+            else:
+                y1 = max(0, cy - half)
+                y0 = max(0, y1 - band_h)
+            x0, x1 = 0, W
+
+        if x1 - x0 < 6 or y1 - y0 < 6:
+            return []
+
+        crop = region[y0:y1, x0:x1]
+        gray = ImageOps.autocontrast(Image.fromarray(crop).convert('L'), cutoff=2)
+        variants = [np.array(gray.convert('RGB')), np.array(ImageOps.invert(gray).convert('RGB'))]
+        if relax:
+            bw = gray.point(lambda p: 255 if p > 168 else 0)
+            variants.extend([
+                np.array(bw.convert('RGB')),
+                np.array(ImageOps.invert(bw).convert('RGB')),
+            ])
+
+        _SUBS = str.maketrans('OolISBZG', '00115826')
+        raw = []  # (frac, value, conf)
+        min_conf = 0.20 if relax else 0.28
+        for img_arr in variants:
+            results = reader.readtext(
+                img_arr,
+                detail=1,
+                allowlist='0123456789.-eE+',
+                adjust_contrast=0.5,
+                paragraph=False,
+                width_ths=0.7,
+                contrast_ths=0.05,
+            )
+            for box, text, conf in results:
+                if float(conf) < min_conf:
+                    continue
+                s = text.strip().replace(' ', '').translate(_SUBS)
+                cands = self._value_candidates_from_text(s)
+                if not cands:
+                    continue
+                # 文字列長と値の過大さを弱く正則化して候補を選ぶ
+                def _cand_score(v):
+                    score = float(conf)
+                    if '.' in s:
+                        score += 0.03
+                    if abs(v) <= 200:
+                        score += 0.02
+                    if abs(v) <= 20:
+                        score += 0.02
+                    return score
+
+                val = max(cands, key=_cand_score)
+                if is_vertical:
+                    axis_local = (box[0][1] + box[2][1]) / 2.0
+                    frac = (y0 + axis_local) / max(H - 1, 1)
+                else:
+                    axis_local = (box[0][0] + box[2][0]) / 2.0
+                    frac = (x0 + axis_local) / max(W - 1, 1)
+                frac = max(0.0, min(1.0, float(frac)))
+                raw.append((frac, float(val), float(conf)))
+
+        if not raw:
+            return []
+
+        # 近接ラベルをクラスタリングし、高信頼なものだけ残す
+        raw.sort(key=lambda t: t[0])
+        clustered = []
+        cluster = [raw[0]]
+        for item in raw[1:]:
+            frac_tol = 0.024 if relax else 0.018
+            if abs(item[0] - cluster[-1][0]) <= frac_tol:
+                cluster.append(item)
+            else:
+                clustered.append(max(cluster, key=lambda t: t[2]))
+                cluster = [item]
+        clustered.append(max(cluster, key=lambda t: t[2]))
+        return clustered
+
+    def _ocr_pairs_by_tick_alignment(self, region, tick_px, is_vertical, side, reader, cb_center=None, tol_scale=1.0):
+        """ラベル帯を一括OCRし、文字中心を最近傍の目盛りに対応付ける。"""
+        if not tick_px:
+            return []
+
+        H, W = region.shape[:2]
+        if is_vertical:
+            cx = cb_center if cb_center is not None else W // 2
+            half = max(2, W // 10)
+            band_w = max(40, min(W // 2, 140))
+            if side == 'right':
+                x0 = min(W, cx + half)
+                x1 = min(W, x0 + band_w)
+            else:
+                x1 = max(0, cx - half)
+                x0 = max(0, x1 - band_w)
+            y0, y1 = 0, H
+        else:
+            cy = cb_center if cb_center is not None else H // 2
+            half = max(2, H // 10)
+            band_h = max(28, min(H // 2, 90))
+            if side == 'bottom':
+                y0 = min(H, cy + half)
+                y1 = min(H, y0 + band_h)
+            else:
+                y1 = max(0, cy - half)
+                y0 = max(0, y1 - band_h)
+            x0, x1 = 0, W
+
+        if x1 - x0 < 6 or y1 - y0 < 6:
+            return []
+
+        parsed = []
+        for frac, val, conf in self._extract_label_candidates(
+            region, is_vertical, side, reader, cb_center, relax=(tol_scale > 1.2)
+        ):
+            axis_px = frac * max((H if is_vertical else W) - 1, 1)
+            parsed.append((axis_px, val, conf))
+
+        if not parsed:
+            return []
+
+        # 最短目盛り間隔を基に対応許容幅を決める
+        sorted_ticks = sorted(tick_px)
+        gaps = [b - a for a, b in zip(sorted_ticks, sorted_ticks[1:]) if b - a > 0]
+        min_gap = min(gaps) if gaps else 20
+        total_len = max((H if is_vertical else W) - 1, 1)
+        # 目盛り間隔 + 画像解像度に応じて自動調整
+        tol_by_gap = min_gap * 0.42
+        tol_by_size = total_len * 0.018
+        tol = max(6.0, min(36.0, max(tol_by_gap, tol_by_size))) * float(tol_scale)
+
+        best_for_tick = {}  # tick_idx -> (conf, value)
+        for axis_px, val, conf in parsed:
+            idx = min(range(len(tick_px)), key=lambda i: abs(tick_px[i] - axis_px))
+            dist = abs(tick_px[idx] - axis_px)
+            if dist > tol:
+                continue
+            prev = best_for_tick.get(idx)
+            if prev is None or conf > prev[0]:
+                best_for_tick[idx] = (conf, val)
+
+        total = (H if is_vertical else W) - 1
+        pairs = []
+        for idx, (_, val) in best_for_tick.items():
+            frac = tick_px[idx] / max(total, 1)
+            pairs.append((frac, val))
+        pairs.sort(key=lambda x: x[0])
         return pairs
+
+    @staticmethod
+    def _filter_value_pairs(pairs):
+        """OCRの外れ値を軽く除去し、単調な目盛り列を優先する。"""
+        if len(pairs) < 3:
+            return pairs
+
+        pairs = sorted(pairs, key=lambda x: x[0])
+        fracs = np.array([f for f, _ in pairs], dtype=np.float64)
+        vals = np.array([v for _, v in pairs], dtype=np.float64)
+
+        # RANSAC風に最も整合する直線を選び、あり得ない外れ値を落とす
+        n = len(vals)
+        best_mask = np.ones(n, dtype=bool)
+        best_count = 0
+        best_err = float('inf')
+
+        val_range = float(np.max(vals) - np.min(vals)) if n > 1 else 0.0
+        dvals = np.abs(np.diff(np.sort(vals))) if n > 2 else np.array([0.0])
+        step = float(np.median(dvals[dvals > 0])) if np.any(dvals > 0) else 1.0
+        tol = max(0.08 * max(val_range, 1.0), 0.8 * max(step, 0.1), 0.12)
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                df = fracs[j] - fracs[i]
+                if abs(df) < 1e-9:
+                    continue
+                m = (vals[j] - vals[i]) / df
+                b = vals[i] - m * fracs[i]
+                pred = m * fracs + b
+                err = np.abs(vals - pred)
+                mask = err <= tol
+                cnt = int(mask.sum())
+                med_err = float(np.median(err[mask])) if cnt > 0 else float('inf')
+                if cnt > best_count or (cnt == best_count and med_err < best_err):
+                    best_count = cnt
+                    best_err = med_err
+                    best_mask = mask
+
+        inlier_ratio = float(np.mean(best_mask))
+        filtered = [p for p, k in zip(pairs, best_mask) if bool(k)]
+        # 強すぎる削除を避ける: inlierが少なすぎる場合は全候補を維持
+        if len(filtered) < 2 or inlier_ratio < 0.55:
+            filtered = pairs
+
+        # 単調方向も最終チェック
+        vals2 = np.array([v for _, v in filtered], dtype=np.float64)
+        if len(vals2) >= 3:
+            d = np.diff(vals2)
+            direction = 1.0 if np.median(d) >= 0 else -1.0
+            ok = direction * d >= 0
+            if ok.mean() >= 0.6:
+                keep = [True] + [bool(x) for x in ok]
+                mono = [p for p, k in zip(filtered, keep) if k]
+                if len(mono) >= 2:
+                    filtered = mono
+
+        return filtered
 
     def _find_tick_positions(self, region, is_vertical, cb_center=None):
         """目盛り線を検出。(tick_fractions_list, side) を返す。"""
@@ -946,13 +1360,14 @@ class ColorPickerApp:
                 t = self._ticks_from_strip(strip, total_len)
                 if len(t) > len(best_ticks):
                     best_ticks = t
-            return best_ticks
+            return best_ticks, self._tick_score(best_ticks, total_len)
 
+        best = ([], 'right', 0.0)
         if is_vertical:
             cx   = cb_center if cb_center is not None else W // 2
             half = max(2, W // 10)
             # 目盛りマーカーが延びる幅のみ走査（ラベルテキスト領域を除外する）
-            tick_zone = max(8, min(25, W // 8))
+            tick_zone = max(8, min(self._TICK_MAX_ZONE, W // 4))
             for side, z_start, z_end in [
                 ('right', cx + half,                     min(W, cx + half + tick_zone)),
                 ('left',  max(0, cx - half - tick_zone), cx - half),
@@ -960,13 +1375,13 @@ class ColorPickerApp:
                 z_start, z_end = max(0, z_start), min(W, z_end)
                 if z_end - z_start < 2:
                     continue
-                ticks = best_in_band(z_start, z_end, H)
-                if len(ticks) >= 2:
-                    return [t / max(H - 1, 1) for t in ticks], side
+                ticks, score = best_in_band(z_start, z_end, H)
+                if len(ticks) >= 2 and score > best[2]:
+                    best = (ticks, side, score)
         else:
             cy   = cb_center if cb_center is not None else H // 2
             half = max(2, H // 10)
-            tick_zone = max(8, min(25, H // 8))
+            tick_zone = max(8, min(self._TICK_MAX_ZONE, H // 4))
             for side, z_start, z_end in [
                 ('bottom', cy + half,                     min(H, cy + half + tick_zone)),
                 ('top',    max(0, cy - half - tick_zone), cy - half),
@@ -974,9 +1389,12 @@ class ColorPickerApp:
                 z_start, z_end = max(0, z_start), min(H, z_end)
                 if z_end - z_start < 2:
                     continue
-                ticks = best_in_band(z_start, z_end, W, horizontal=True)
-                if len(ticks) >= 2:
-                    return [t / max(W - 1, 1) for t in ticks], side
+                ticks, score = best_in_band(z_start, z_end, W, horizontal=True)
+                if len(ticks) >= 2 and score > best[2]:
+                    best = (ticks, side, score)
+        if len(best[0]) >= 2:
+            total = H if is_vertical else W
+            return [t / max(total - 1, 1) for t in best[0]], best[1]
         return [], 'right'
 
     @staticmethod
@@ -1004,12 +1422,19 @@ class ColorPickerApp:
                     0.114 * strip[..., 2]).astype(np.float32)
         row_mean = gray.mean(axis=1)                    # (total_len,)
 
+        # 局所ノイズに引きずられないよう軽く平滑化
+        if len(row_mean) >= 5:
+            row_mean = np.convolve(row_mean, np.ones(5, dtype=np.float32) / 5.0, mode='same')
+
         def extract_ticks(bg_pct):
             bg  = np.percentile(row_mean, bg_pct)
             dev = np.abs(row_mean - bg)
             if dev.max() < 5:
                 return []
-            is_tick = dev > dev.max() * 0.25
+            med = np.median(dev)
+            mad = np.median(np.abs(dev - med)) + 1e-6
+            thr = max(dev.max() * 0.22, med + 2.5 * mad)
+            is_tick = dev > thr
             ticks, i = [], 0
             while i < total_len:
                 if is_tick[i]:
@@ -1022,7 +1447,7 @@ class ColorPickerApp:
                     i += 1
             filtered = [ticks[0]] if ticks else []
             for t in ticks[1:]:
-                if t - filtered[-1] >= 4:
+                if t - filtered[-1] >= self._TICK_MIN_GAP:
                     filtered.append(t)
             return filtered
 
@@ -1079,7 +1504,10 @@ class ColorPickerApp:
         def _ocr_best(img_arr):
             results = reader.readtext(img_arr, detail=1,
                                       allowlist='0123456789.-eE+',
-                                      adjust_contrast=0.5)
+                                      adjust_contrast=0.5,
+                                      paragraph=False,
+                                      width_ths=0.7,
+                                      contrast_ths=0.05)
             if not results:
                 return None, 0.0
             # 左→右の順にソート（小数点が別ボックスになる場合に備える）
@@ -1129,16 +1557,19 @@ class ColorPickerApp:
             best_val, best_conf = max(candidates, key=_score)
             return best_val, best_conf
 
-        # 通常画像でOCR
+        # 複数前処理を試し、最良信頼度を採用
         crop_normal = np.array(gray.convert('RGB'))
-        best_val, best_conf = _ocr_best(crop_normal)
+        crop_inv = np.array(ImageOps.invert(gray).convert('RGB'))
+        bw = gray.point(lambda p: 255 if p > 170 else 0)
+        crop_bw = np.array(bw.convert('RGB'))
+        bw_inv = ImageOps.invert(bw)
+        crop_bw_inv = np.array(bw_inv.convert('RGB'))
 
-        # 信頼度が低い場合は反転画像でも試みる（暗背景・白文字対応）
-        if best_conf < 0.7:
-            crop_inv = np.array(ImageOps.invert(gray).convert('RGB'))
-            inv_val, inv_conf = _ocr_best(crop_inv)
-            if inv_conf > best_conf:
-                best_val = inv_val
+        best_val, best_conf = None, 0.0
+        for variant in (crop_normal, crop_inv, crop_bw, crop_bw_inv):
+            cand_val, cand_conf = _ocr_best(variant)
+            if cand_conf > best_conf:
+                best_val, best_conf = cand_val, cand_conf
 
         return best_val
 
